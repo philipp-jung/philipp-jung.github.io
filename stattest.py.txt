@@ -1,0 +1,129 @@
+from typing import Tuple, Callable
+import pandas as pd
+from autogluon.tabular import TabularPredictor
+from scipy.stats import ttest_rel, wilcoxon
+
+def get_performance(ag_predictor) -> Tuple[list[float], str]:
+    model_info = ag_predictor.info()['model_info']
+    performances = []
+    
+    for child_model in model_info['XGBoost_BAG_L1']['children_info']:
+        child_info = model_info['XGBoost_BAG_L1']['children_info'][child_model]
+        eval_metric = child_info['eval_metric']
+        performances.append(child_info['val_score'])
+    return performances, eval_metric
+
+def test_mechanism(perf_err: list[float], perf_err_rnd: list[float], perf_obs: list[float], perf_obs_rnd: list[float], test_fun: Callable) -> str:
+    """
+    Funktion, um mittels Hypothesentests aus Performancemetriken unterschliedlicher Modelle zu ermitteln, welcher Fehlermechanismus vorliegt.
+    Der Ansatz der Hypothesentests muss wahrscheinlich weiter iteriert werden. Andere mögliche Ansätze sind
+    - 5x2 CV Procedure (https://machinelearningmastery.com/hypothesis-test-for-comparing-machine-learning-algorithms/)
+    - ein grundsätzlich anderer Testaufbau.
+    
+    TODO Mögliche Überarbeitungen sind nach einer empirischen Auswertung zu bewerten.
+    """
+    # h_0: err and obs have the same mean performance.
+    # h_1: err has a greater mean performance than obs.
+    t_err_greater_obs, p_err_greater_obs = test_fun(perf_err, perf_obs, alternative='greater')
+
+    # h_0: err and err_rand have the same mean performance.
+    # h_1: err has a greater mean performance than err_rand.
+    t_err_greater_rnd, p_err_greater_rnd = test_fun(perf_err, perf_err_rnd, alternative='greater')
+
+    adj_significance_level = .05 / 2  # Bonferroni correction
+    if p_err_greater_rnd < adj_significance_level and p_err_greater_obs < adj_significance_level:
+        return 'MNAR'
+
+    # h_0: obs and obs_rnd have the same mean performance.
+    # h_1: err has a better mean performance than obs_rnd
+    t_obs_greater_rnd, p_obs_greater_rnd = test_fun(perf_obs, perf_obs_rnd, alternative='greater')
+
+    if p_err_greater_obs < .05:  # no evidence that adding data Y_err improves performance
+        if p_obs_greater_rnd < .05:  # no need for Bonferroni because the line above assumes the Null Hypothesis
+            return 'MAR'
+    return 'MCAR'
+
+
+def fit_classifiers(df_err, df_obs, df_mask, label) -> list[TabularPredictor]:
+    pos_label = f'pos_{label}'
+    
+    if len(df_mask[pos_label].unique()) == 1:  # every row in pos_label is an error or clean
+        return 'ecar'
+
+    hyperparameters = {
+        'XGB': {
+            'n_estimators': 100,
+            'learning_rate': 0.1,
+            'max_depth': 6,
+        }
+    }
+
+    clf_err = TabularPredictor(label=pos_label, problem_type='binary').fit(df_err, num_bag_folds=20, num_stack_levels=0, hyperparameters=hyperparameters, verbosity=0)
+    clf_obs = TabularPredictor(label=pos_label, problem_type='binary').fit(df_obs, num_bag_folds=20, num_stack_levels=0, hyperparameters=hyperparameters, verbosity=0)
+    
+    shuffled_target = df_mask[pos_label].sample(frac=1).reset_index(drop=True)
+    df_err.loc[:, 'shuffled'] = shuffled_target
+    df_obs.loc[:, 'shuffled'] = shuffled_target
+    
+    clf_err_rnd = TabularPredictor(label='shuffled', problem_type='binary').fit(df_err, num_bag_folds=20, num_stack_levels=0, hyperparameters=hyperparameters, verbosity=0)
+    clf_obs_rnd = TabularPredictor(label='shuffled', problem_type='binary').fit(df_obs, num_bag_folds=20, num_stack_levels=0, hyperparameters=hyperparameters, verbosity=0)
+
+    return clf_err, clf_err_rnd, clf_obs, clf_obs_rnd
+
+
+def test_column_mechanism(df_clean: pd.DataFrame, df_mask: pd.DataFrame, dataset_name: str, label: str) -> dict:
+    pos_label = f'pos_{label}'
+    df_obs = pd.concat([df_clean.drop(columns=[label]), df_mask[[pos_label]]], axis=1)
+    df_err = pd.concat([df_clean, df_mask[[pos_label]]], axis=1)
+    
+    fraction_of_all_errors = round(df_mask[pos_label].sum() / df_mask.sum().sum(), 2)
+    clf_err, clf_err_rnd, clf_obs, clf_obs_rnd = fit_classifiers(df_err, df_obs, df_mask, label)
+    perf_err, metric = get_performance(clf_err)
+    perf_err_rnd, metric = get_performance(clf_err_rnd)
+    perf_obs, metric = get_performance(clf_obs)
+    perf_obs_rnd, metric = get_performance(clf_obs_rnd)
+
+    nonparametric = False  # TODO: do I need to test my data for normality with code?
+    if nonparametric:
+        mechanism = test_mechanism(perf_err, perf_err_rnd, perf_obs, perf_obs_rnd, test_fun=wilcoxon)
+    else:
+        mechanism = test_mechanism(perf_err, perf_err_rnd, perf_obs, perf_obs_rnd, test_fun=ttest_rel)
+
+    return {'dataset': dataset_name,
+            'label': label,
+            'fraction_of_all_errors': fraction_of_all_errors,
+            'mechanism': mechanism,
+            'perf_err': [round(p, 2) for p in perf_err],
+            'perf_err_rnd': [round(p, 2) for p in perf_err_rnd],
+            'perf_obs': [round(p, 2) for p in perf_obs],
+            'perf_obs_rnd': [round(p, 2) for p in perf_obs_rnd],
+            'metric': metric}
+
+
+# TODO refactor code below into a nice class
+def test_dataset_mechanism(dataset_name: str) -> list[dict]:
+    df_clean = pd.read_csv(f'../2024W23-error-distribution/datasets/{dataset_name}/clean.csv', sep=",", header="infer", encoding="utf-8", dtype=str,
+                                    keep_default_na=False, low_memory=False)
+    df_dirty = pd.read_csv(f'../2024W23-error-distribution/datasets/{dataset_name}/dirty.csv', sep=",", header="infer", encoding="utf-8", dtype=str,
+                                    keep_default_na=False, low_memory=False)
+    df_mask = df_clean != df_dirty
+    
+    labels = [l for l, counts in df_mask.sum().to_dict().items() if counts > 0]
+    df_mask.columns = [f'pos_{c}' for c in df_mask.columns]
+    
+    results = []
+    for label in labels:
+        column_result = test_column_mechanism(df_clean, df_mask, dataset_name, label)
+        results.append(column_result)
+    return results
+
+def test_dataframe_mechanism(df_clean: pd.DataFrame, df_dirty: pd.DataFrame) -> list[dict]:
+    df_mask = df_clean != df_dirty
+    labels = [l for l, counts in df_mask.sum().to_dict().items() if counts > 0]
+    df_mask.columns = [f'pos_{c}' for c in df_mask.columns]
+    
+    results = []
+    for label in labels:
+        column_result = test_column_mechanism(df_clean, df_mask, 'df', label)
+        results.append(column_result)
+    return results
